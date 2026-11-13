@@ -1,0 +1,31 @@
+name: Host CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  host:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7.1.0
+        with:
+          node-version: 26.13.1
+      - run: bash build.sh
+      - run: node test.mjs
+      - run: python3 -m unittest discover -s tests -p 'test_*.py'
+      - run: npm install --prefix sdk/plugin-kit --ignore-scripts --no-package-lock --no-audit --no-fund
+      - run: npm test --prefix sdk/plugin-kit
+      - run: npm install --prefix media/dsh-media --ignore-scripts --no-package-lock --no-audit --no-fund
+      - run: npm test --prefix media/dsh-media
+      - uses: actions/upload-artifact@v7.0.2
+        with:
+          name: host
+          path: dist/host.tgz
+          if-no-files-found: error

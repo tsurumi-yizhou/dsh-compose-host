@@ -1,0 +1,82 @@
+import { execFileSync } from 'node:child_process';
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { randomUUID } from 'node:crypto';
+import { Writable } from 'node:stream';
+import { Deployments } from '../bundles/dsh-compose-app/lib/protocol/deployments.mjs';
+
+test('self-update binds a staged artifact and durable receipt to the originating device across host restarts', async t => {
+  const directory = mkdtempSync(join(tmpdir(), 'compose-install-'));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const phone = { id: randomUUID() }, other = { id: randomUUID() };
+  const grants = { list: () => [{ ...phone, expiresAt: Date.now() + 60_000 }] };
+  const state = join(directory, 'jobs'), path = join(directory, 'app.apk');
+  writeFileSync(path, 'built-apk');
+  let service = new Deployments(state, grants);
+  service.poll(phone, { application: 'dev.fughetta.dshcompose', name: 'Phone' });
+  const prompt = { sessionId: 'development-session', requestId: randomUUID() };
+  service.bindPrompt(phone, prompt);
+  const agent = { session: { id: prompt.sessionId, snapshotEvents: () => [
+    { type: 'user/message', data: { source: { kind: 'user', rpcId: prompt.requestId } } },
+  ] } };
+  assert.equal(service.originatingDevice(agent), phone.id);
+  assert.throws(() => service.bindPrompt(other, prompt), { code: 'deploy/prompt-owner' });
+  const installing = service.deploy(path, { agent, signal: new AbortController().signal });
+  // The tool call stays open until the durable receipt arrives.
+  while (service.jobs.size === 0) await new Promise(resolve => setTimeout(resolve, 10));
+  const original = service;
+  const job = await service.enqueue({ path, deviceId: phone.id }, 'development-session');
+  assert.equal((await service.enqueue({ path, deviceId: phone.id }, 'development-session')).id, job.id);
+  writeFileSync(path, 'next-build');
+  service = new Deployments(state, grants);
+  assert.equal(service.originatingDevice(agent), phone.id);
+  assert.throws(() => service.owned(job.id, other), { code: 'deploy/not-found' });
+  assert.throws(() => service.receipt(other, job.id, { status: 'succeeded' }), { code: 'deploy/not-found' });
+  let downloaded = '';
+  const response = new Writable({ write(chunk, _, done) { downloaded += chunk; done(); } });
+  response.writeHead = (status, headers) => { assert.equal(status, 200); assert.equal(headers['content-length'], 9); };
+  await service.download(phone, job.id, response);
+  assert.equal(downloaded, 'built-apk');
+  service.receipt(phone, job.id, { status: 'deploying' });
+  service = new Deployments(state, grants);
+  assert.equal(service.poll(phone, { application: 'dev.fughetta.dshcompose', name: 'Phone' }).jobs[0].status, 'deploying');
+  service.receipt(phone, job.id, { status: 'succeeded', message: 'INSTALL_SUCCESS' });
+  original.receipt(phone, job.id, { status: 'succeeded', message: 'INSTALL_SUCCESS' });
+  assert.equal((await installing).status, 'succeeded');
+  service = new Deployments(state, grants);
+  assert.equal(service.jobs.get(job.id).status, 'succeeded');
+  assert.equal(service.poll(phone, { application: 'dev.fughetta.dshcompose', name: 'Phone' }).jobs.length, 0);
+  assert.equal(existsSync(join(state, `${job.id}.artifact`)), false);
+  assert.equal(service.receipt(phone, job.id, { status: 'downloading' }).status, 'succeeded');
+});
+
+test('directory artifacts are opaque to the host and temporary files expire', async t => {
+  const directory = mkdtempSync(join(tmpdir(), 'compose-deploy-'));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  let now = Date.now();
+  const client = { id: randomUUID() };
+  const state = join(directory, 'jobs'), path = join(directory, 'dist');
+  mkdirSync(path);
+  writeFileSync(join(path, 'index.html'), '<h1>Build</h1>');
+  const service = new Deployments(state, { list: () => [{ ...client, expiresAt: now + 60_000 }] }, () => now);
+  service.poll(client, { application: 'web-preview', name: 'Browser' });
+  const job = await service.enqueue({ path, deviceId: client.id }, 'web-session');
+  assert.equal(job.kind, 'directory');
+  assert.equal(job.encoding, 'tar');
+  const artifact = join(state, `${job.id}.artifact`);
+  assert.equal(execFileSync('tar', ['-xOf', artifact, './index.html'], { encoding: 'utf8' }), '<h1>Build</h1>');
+  writeFileSync(join(state, `${randomUUID()}.artifact`), 'interrupted staging');
+  service.cleanup();
+  now += 86_400_000;
+  service.cleanup();
+  assert.equal(existsSync(artifact), false);
+  assert.equal(service.jobs.get(job.id).status, 'unknown');
+  assert.equal(readFileSync(join(path, 'index.html'), 'utf8'), '<h1>Build</h1>');
+  now += 86_400_000;
+  service.cleanup();
+  assert.equal(service.jobs.size, 0);
+  assert.equal(existsSync(join(state, `${job.id}.json`)), false);
+});

@@ -1,0 +1,9 @@
+{
+  "name": "dsh-compose-host",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "bash build.sh",
+    "test": "node test.mjs"
+  }
+}
